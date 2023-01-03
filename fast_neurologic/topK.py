@@ -6,13 +6,58 @@ from operator import attrgetter
 from typing import Dict, List, Optional, Tuple, Set, Union
 import transformers
 import multiprocessing as mp
+from functools import partial
 
 from fast_lexical_constraints import ConstrainedHypothesis, ConstrainedCandidate
-from fast_a_star.look_ahead import _generate_beam_search, _generate_greedy, _generate_sample
 
 
 def _reorder_cache(past: Tuple, beam_idx: torch.Tensor) -> Tuple[torch.Tensor]:
     return tuple(layer_past.index_select(1, beam_idx) for layer_past in past)
+
+
+def perturb(timestep, beam_size, batch_size, prune_factor, sat_tolerance, inactive, scores, hypotheses,
+            best_ids, best_word_ids, seq_scores, num_fill, init_length, select_best_ids, select_best_word_ids,
+            select_seq_scores, select_hypotheses, select_num_mets, pad_token_id, sentno):
+    rows = slice(sentno * beam_size, sentno * beam_size + beam_size)
+
+    if all([x is None for x in hypotheses[rows]]):
+        select_best_ids[sentno] = [0] * num_fill
+        select_best_word_ids[sentno] = [pad_token_id] * num_fill
+        select_seq_scores[sentno] = [0] * num_fill
+        select_hypotheses[sentno] = [None] * num_fill
+        select_num_mets[sentno] = [-1] * num_fill
+
+    else:
+        assert not any([x is None for x in hypotheses[rows]]), 'Bad state'
+
+        select_best_ids[sentno], select_best_word_ids[sentno], select_seq_scores[sentno], \
+        select_hypotheses[sentno], select_num_mets[sentno] = _sequential_topk(sentno,
+                                                                              timestep,
+                                                                              beam_size,
+                                                                              batch_size,
+                                                                              prune_factor,
+                                                                              sat_tolerance,
+                                                                              inactive[sentno],
+                                                                              scores[sentno],
+                                                                              hypotheses[rows],
+                                                                              best_ids[sentno],
+                                                                              best_word_ids[sentno],
+                                                                              seq_scores[sentno],
+                                                                              num_fill,
+                                                                              init_length)
+
+    return sentno, select_best_ids[sentno], select_best_word_ids[sentno], select_seq_scores[sentno], \
+           select_hypotheses[sentno], select_num_mets[sentno]
+
+
+def allocate(select_best_ids, select_best_word_ids, select_seq_scores, select_hypotheses, select_num_mets, value):
+    sentno, select_best_id, select_best_word_id, select_seq_score, select_hypothesis, select_num_met = value
+    select_best_ids[sentno] = select_best_id
+    select_best_word_ids[sentno] = select_best_word_id
+    select_seq_scores[sentno] = select_seq_score
+    select_hypotheses[sentno] = select_hypothesis
+    select_num_mets[sentno] = select_num_met
+
 
 def topk_huggingface(timestep: int,
                      batch_size: int,
@@ -48,7 +93,7 @@ def topk_huggingface(timestep: int,
     """
 
     seq_scores, raw_token_idx = torch.topk(scores, beam_size, dim=1, largest=True, sorted=True)
-    best_ids = (raw_token_idx // vocab_size).cpu().numpy()
+    best_ids = (torch.div(raw_token_idx // vocab_size)).cpu().numpy()
     best_word_ids = (raw_token_idx % vocab_size).cpu().numpy()
     seq_scores = seq_scores.cpu().numpy()
 
@@ -60,40 +105,20 @@ def topk_huggingface(timestep: int,
     select_hypotheses = [[None] * num_fill for _ in range(batch_size)]
     select_num_mets = [[-1] * num_fill for _ in range(batch_size)]
 
-    def perturb(sentno):
-        rows = slice(sentno * beam_size, sentno * beam_size + beam_size)
-
-        if all([x is None for x in hypotheses[rows]]):
-            select_best_ids[sentno] = [0] * num_fill
-            select_best_word_ids[sentno] = [pad_token_id] * num_fill
-            select_seq_scores[sentno] = [0] * num_fill
-            select_hypotheses[sentno] = [None] * num_fill
-            select_num_mets[sentno] = [-1] * num_fill
-            return
-
-        assert not any([x is None for x in hypotheses[rows]]), 'Bad state'
-
-        select_best_ids[sentno], select_best_word_ids[sentno], select_seq_scores[sentno],\
-            select_hypotheses[sentno], select_num_mets[sentno] = _sequential_topk(sentno,
-                                                                                  timestep,
-                                                                                  beam_size,
-                                                                                  batch_size,
-                                                                                  prune_factor,
-                                                                                  sat_tolerance,
-                                                                                  inactive[sentno],
-                                                                                  scores[sentno],
-                                                                                  hypotheses[rows],
-                                                                                  best_ids[sentno],
-                                                                                  best_word_ids[sentno],
-                                                                                  seq_scores[sentno],
-                                                                                  num_fill,
-                                                                                  init_length)
-
+    func = partial(perturb, timestep, beam_size, batch_size, prune_factor, sat_tolerance, inactive, scores, hypotheses,
+                   best_ids, best_word_ids, seq_scores, num_fill, init_length, select_best_ids, select_best_word_ids,
+                   select_seq_scores, select_hypotheses, select_num_mets, pad_token_id)
     pool = mp.Pool(mp.cpu_count())
-    pool.map(perturb, [sentno for sentno in range(batch_size)])
+    values = pool.map(func, [sentno for sentno in range(batch_size)])
+    pool.close()
+    pool.join()
+
+    for value in values:
+        allocate(select_best_ids, select_best_word_ids, select_seq_scores, select_hypotheses, select_num_mets, value)
 
     select_raw_token_idx = select_best_ids * vocab_size + select_best_word_ids
     return select_seq_scores, select_raw_token_idx, select_hypotheses, select_num_mets
+
 
 # from transformers import AutoTokenizer, AutoModelWithLMHead
 # tokenizer = AutoTokenizer.from_pretrained('gpt2')
@@ -112,7 +137,7 @@ def _sequential_topk(sentno: int,
                      sequence_scores: np.array,
                      num_fill: int,
                      init_length: int) -> Tuple[np.array, np.array, np.array,
-                                                       List[ConstrainedHypothesis], List[int]]:
+                                                List[ConstrainedHypothesis], List[int]]:
     """
     Builds a new topk list such that the beam contains hypotheses having completed different numbers of constraints.
     These items are built from three different types: (1) the best items across the whole
@@ -179,7 +204,7 @@ def _sequential_topk(sentno: int,
 
         # Add finished candidates in finished set:
         if hyp.finished():
-            best_k = np.argsort(scores[row])[::-1][:int(beam_size*10)]
+            best_k = np.argsort(scores[row])[::-1][:int(beam_size * 10)]
             for col in best_k:
                 if col in hyp.eos():
                     new_item = hyp.advance(col)
@@ -199,7 +224,8 @@ def _sequential_topk(sentno: int,
         all_sorted_candidates = sorted(candidates, key=attrgetter('score'), reverse=True)
 
         max_satisfy = max([x.hypothesis.num_met() for x in all_sorted_candidates])
-        all_sorted_candidates = [x for x in all_sorted_candidates if x.hypothesis.num_met() >= max_satisfy - sat_tolerance]
+        all_sorted_candidates = [x for x in all_sorted_candidates if
+                                 x.hypothesis.num_met() >= max_satisfy - sat_tolerance]
 
         for i, cand in enumerate(all_sorted_candidates):
             cand.rank = cand.score / (timestep - init_length + 1)
