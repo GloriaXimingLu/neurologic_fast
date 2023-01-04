@@ -42,9 +42,10 @@ class ConstrainedHypothesis:
     def __init__(self,
                  constraint_list: List[List[List[int]]],
                  key_constraint_list: List[List[List[int]]],
-                 eos_id: Union[int, list]
-                 ) -> None:
+                 eos_id: Union[int, list],
+                 ordered: bool) -> None:
         self.eos_id = eos_id if isinstance(eos_id, list) else [eos_id]
+        self.ordered = ordered
         self.orders = []
 
         self.clauses = []
@@ -132,9 +133,14 @@ class ConstrainedHypothesis:
         :return: the literals in unsatisfied clauses
         """
         look_ahead_phrases = []
-        for clause in self.clauses:
+        sorted_clauses = sorted(self.clauses, key=lambda x: x.idx)
+
+        for clause in sorted_clauses:
             if not clause.satisfy:
                 look_ahead_phrases.extend(clause.key_phrases)
+
+                if self.ordered:
+                    break
 
         return look_ahead_phrases
 
@@ -144,8 +150,9 @@ class ConstrainedHypothesis:
         :return: the literals in process
         """
         look_ahead_continues = []
+        sorted_clauses = sorted(self.clauses, key=lambda x: x.idx)
 
-        for clause in self.clauses:
+        for clause in sorted_clauses:
             if clause.satisfy:
                 continue
 
@@ -154,7 +161,33 @@ class ConstrainedHypothesis:
                 if literal.pointer > -1:
                     look_ahead_continues.append(literal.tokens[literal.pointer + 1:])
 
+            if self.ordered:
+                break
+
         return look_ahead_continues
+
+    def max_process(self) -> int:
+        """
+
+        :return: the maximum portion of literals in process
+        """
+        process = 0
+        sorted_clauses = sorted(self.clauses, key=lambda x: x.idx)
+
+        for clause in sorted_clauses:
+            if clause.satisfy:
+                continue
+
+            for literal in clause.literals:
+                assert literal.pointer < len(literal.tokens) - 1 and not literal.satisfy
+                if literal.pointer > -1:
+                    portion = len(literal.tokens[:literal.pointer + 1]) / len(literal.tokens)
+                    process = max(process, portion)
+
+            if self.ordered:
+                break
+
+        return process
 
     def advance(self, word_id: int) -> 'ConstrainedHypothesis':
         obj = pickle.loads(pickle.dumps(self))
@@ -171,41 +204,55 @@ class ConstrainedHypothesis:
 
     def allowed(self) -> Set[int]:
         """
-
         :return: the tokens for next progress
         """
-        allowed = set()
+        allowed_token = set()
+        sorted_clauses = sorted(self.clauses, key=lambda x: x.idx)
 
-        for clause in self.clauses:
+        for clause in sorted_clauses:
             if clause.satisfy:
                 continue
 
             for literal in clause.literals:
                 assert literal.pointer < len(literal.tokens) - 1 and not literal.satisfy
-                allowed.add(literal.tokens[literal.pointer + 1])
-                allowed.add(literal.tokens[0])
+                allowed_token.add(literal.tokens[literal.pointer + 1])
+                allowed_token.add(literal.tokens[0])
 
-        return allowed
+            if self.ordered:
+                break
 
+        return allowed_token
 
+    def is_ordered(self):
+        """
+        :return: whether constraint satisfaction is in order
+        """
+        if not self.ordered:
+            return True
 
-
-
+        sorted_clauses = sorted(self.clauses, key=lambda x: x.idx)
+        for i, clause in enumerate(sorted_clauses):
+            if not clause.satisfy:
+                if not all(not c.satisfy for c in sorted_clauses[i:]):
+                    return False
+        return True
 
 
 def init_batch(raw_constraints: List[List[List[List[int]]]],
                key_constraints: List[List[List[List[int]]]],
                beam_size: int,
-               eos_id: Union[int, list]) -> List[Optional[ConstrainedHypothesis]]:
+               eos_id: Union[int, list],
+               ordered: bool) -> List[Optional[ConstrainedHypothesis]]:
     """
     :param raw_constraints: The list of clause constraints.
     :param beam_size: The beam size.
     :param eos_id: The target-language vocabulary ID of the EOS symbol.
+    :param ordered: Whether enforce constraints to be satisfied in given order
     :return: A list of ConstrainedHypothesis objects (shape: (batch_size * beam_size,)).
     """
     constraints_list = [None] * (len(raw_constraints) * beam_size)  # type: List[Optional[ConstrainedHypothesis]]
     for i, (raw_list, key_list) in enumerate(zip(raw_constraints, key_constraints)):
-        hyp = ConstrainedHypothesis(raw_list, key_list, eos_id)
+        hyp = ConstrainedHypothesis(raw_list, key_list, eos_id, ordered)
         idx = i * beam_size
         constraints_list[idx:idx + beam_size] = [copy.deepcopy(hyp) for _ in range(beam_size)]
     return constraints_list
@@ -256,7 +303,8 @@ if __name__ == '__main__':
     constraints = init_batch(raw_constraints=clauses,
                              key_constraints=clauses,
                              beam_size=1,
-                             eos_id=0)
+                             eos_id=0,
+                             ordered=True)
 
     constraint = constraints[-1]
     print(constraint)

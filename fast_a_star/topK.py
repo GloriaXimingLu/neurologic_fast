@@ -180,6 +180,8 @@ def _sequential_topk(sentno: int,
         seq_score = float(seq_score)
         new_item = hypotheses[row].advance(col)
         cand = ConstrainedCandidate(row, col, seq_score, new_item)
+        if not cand.hypothesis.is_ordered():
+            continue
         if hypotheses[row].finished():
             finished_candidates.add(cand)
         elif hypotheses[row].is_valid(col) or int(best_next[row]) == col:
@@ -210,13 +212,15 @@ def _sequential_topk(sentno: int,
                 new_item = hyp.advance(col)
                 score = scores[row, col]
                 cand = ConstrainedCandidate(row, col, score, new_item)
+                if not cand.hypothesis.is_ordered():
+                    continue
                 if hyp.finished() and col in hyp.eos():
                     finished_candidates.add(cand)
                 else:
                     candidates.add(cand)
 
         # Add finished candidates in finished set:
-        if hyp.finished():
+        if hyp.finished() and hyp.is_ordered():
             best_k = np.argsort(scores[row])[::-1][:int(beam_size*10)]
             for col in best_k:
                 if col in hyp.eos():

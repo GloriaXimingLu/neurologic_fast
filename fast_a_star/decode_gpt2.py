@@ -23,7 +23,6 @@ def main():
 
     parser.add_argument("--model_name", type=str, help="pretrained language model to use")
     parser.add_argument("--input_path", type=str, help="path of input file")
-    parser.add_argument("--concept_file", type=str, help="file containing input concepts")
     parser.add_argument("--output_file", type=str, help="output file")
     parser.add_argument("--constraint_file", type=str, help="constraint file")
     parser.add_argument("--key_constraint_file", type=str, help="key elements in constraint file")
@@ -58,6 +57,9 @@ def main():
     parser.add_argument('--look_ahead_sample',  action='store_true',
                         help="whether use sampling for looking ahead")
 
+    parser.add_argument('--ordered',  action='store_true',
+                        help="whether satisfy constraint")
+
     args = parser.parse_args()
     print(args)
 
@@ -76,26 +78,26 @@ def main():
     bad_token = [':', "'", '-', '_', '@', 'Ċ', 'Ġ:', 'Ġwho', "'s"]
     bad_words_ids = [tokenizer.convert_tokens_to_ids([t]) for t in bad_token]
 
-    def read_constraints(file_name):
+    def read_constraints(file_name, prompts):
         cons_list = []
         with open(file_name, 'r') as f:
-            for i, line in enumerate(f):
+            for i, (line, prefix) in enumerate(zip(f, prompts)):
                 cons = []
                 for concept in json.loads(line):
+                    if any(c in prefix.split() for c in concept):
+                        continue
                     cons.append([f' {c}' for c in concept if c.islower()])
                 cons_list.append(cons)
         return cons_list
 
-    constraints_list = read_constraints(args.constraint_file)
-    key_constraints_list = read_constraints(args.key_constraint_file)
+    prompt_lines = [l.strip() for l in open(args.input_path, 'r').readlines()]
+    input_lines = [tokenizer.convert_tokens_to_ids(tokenizer.tokenize(x)) for x in prompt_lines]
+
+    constraints_list = read_constraints(args.constraint_file, prompt_lines)
+    key_constraints_list = read_constraints(args.key_constraint_file, prompt_lines)
 
     constraints_list = utils.tokenize_constraints(tokenizer, constraints_list)
     key_constraints_list = utils.tokenize_constraints(tokenizer, key_constraints_list)
-
-    input_lines = [l.strip() for l in open(args.input_path, 'r').readlines()]
-    input_lines = [tokenizer.convert_tokens_to_ids(tokenizer.tokenize(x)) for x in input_lines]
-
-    concepts = [l.strip() for l in open(args.concept_file, 'r').readlines()]
 
     if path.exists(args.output_file):
         count = len(open(args.output_file, 'r').readlines())
@@ -114,7 +116,8 @@ def main():
             constraints = init_batch(raw_constraints=constraints_list[next_i:next_i + args.batch_size],
                                      key_constraints=key_constraints_list[next_i:next_i + args.batch_size],
                                      beam_size=args.beam_size,
-                                     eos_id=eos_ids)
+                                     eos_id=eos_ids,
+                                     ordered=args.ordered)
 
             buf = _chunk
             next_i += args.batch_size
@@ -127,13 +130,6 @@ def main():
             attention_mask = (~torch.eq(input_ids, PAD_ID)).int()
             attention_mask = attention_mask.to('cuda')
 
-            advanced_constraints = []
-            for j, init_cons in enumerate(constraints):
-                adv_cons = init_cons
-                for token in _chunk[j // args.beam_size]:
-                    adv_cons = adv_cons.advance(token)
-                advanced_constraints.append(adv_cons)
-
             outputs, scores, sum_logprobs = generate(self=model,
                                                      input_ids=input_ids,
                                                      attention_mask=attention_mask,
@@ -144,7 +140,7 @@ def main():
                                                      num_beams=args.beam_size,
                                                      no_repeat_ngram_size=args.ngram_size,
                                                      length_penalty=args.length_penalty,
-                                                     constraints=advanced_constraints,
+                                                     constraints=constraints,
                                                      prune_factor=args.prune_factor,
                                                      sat_tolerance=args.sat_tolerance,
                                                      look_ahead_step=args.look_ahead_step,

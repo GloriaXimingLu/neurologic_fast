@@ -37,6 +37,7 @@ def generate(
     constraints: Optional[List[Optional[ConstrainedHypothesis]]] = None,
     prune_factor: Optional[int] = None,
     sat_tolerance: Optional[int] = None,
+    beta: Optional[int] = None,
     **model_specific_kwargs
 ) -> torch.LongTensor:
     r""" Generates sequences for models with a LM head. The method currently supports greedy decoding, beam-search decoding, sampling with temperature, sampling with top-k or nucleus sampling.
@@ -334,6 +335,7 @@ def generate(
             constraints=constraints,
             prune_factor=prune_factor,
             sat_tolerance=sat_tolerance,
+            beta=beta,
             model_specific_kwargs=model_specific_kwargs,
         )
     else:
@@ -421,6 +423,7 @@ def _generate_beam_search(
         constraints,
         prune_factor,
         sat_tolerance,
+        beta,
         model_specific_kwargs,
 ):
     """ Generate sequences for each example with beam search.
@@ -527,6 +530,7 @@ def _generate_beam_search(
                                                                                pad_token_id=pad_token_id,
                                                                                prune_factor=prune_factor,
                                                                                sat_tolerance=sat_tolerance,
+                                                                               beta=beta,
                                                                                inactive=np.zeros((batch_size, num_beams)),
                                                                                scores=full_scores,
                                                                                hypotheses=constraints,

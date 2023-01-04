@@ -4,7 +4,7 @@ from torch.nn import functional as F
 from scipy.stats import rankdata
 from operator import attrgetter
 from typing import Dict, List, Optional, Tuple, Set, Union
-import transformers
+import math
 import multiprocessing as mp
 from functools import partial
 
@@ -15,7 +15,7 @@ def _reorder_cache(past: Tuple, beam_idx: torch.Tensor) -> Tuple[torch.Tensor]:
     return tuple(layer_past.index_select(1, beam_idx) for layer_past in past)
 
 
-def perturb(timestep, beam_size, batch_size, prune_factor, sat_tolerance, inactive, scores, hypotheses,
+def perturb(timestep, beam_size, batch_size, prune_factor, sat_tolerance, beta, inactive, scores, hypotheses,
             best_ids, best_word_ids, seq_scores, num_fill, init_length, select_best_ids, select_best_word_ids,
             select_seq_scores, select_hypotheses, select_num_mets, pad_token_id, sentno):
     rows = slice(sentno * beam_size, sentno * beam_size + beam_size)
@@ -37,6 +37,7 @@ def perturb(timestep, beam_size, batch_size, prune_factor, sat_tolerance, inacti
                                                                               batch_size,
                                                                               prune_factor,
                                                                               sat_tolerance,
+                                                                              beta,
                                                                               inactive[sentno],
                                                                               scores[sentno],
                                                                               hypotheses[rows],
@@ -66,6 +67,7 @@ def topk_huggingface(timestep: int,
                      pad_token_id: int,
                      prune_factor: int,
                      sat_tolerance: float,
+                     beta: float,
                      inactive: np.array,
                      scores: np.array,
                      hypotheses: List[ConstrainedHypothesis],
@@ -93,7 +95,7 @@ def topk_huggingface(timestep: int,
     """
 
     seq_scores, raw_token_idx = torch.topk(scores, beam_size, dim=1, largest=True, sorted=True)
-    best_ids = (torch.div(raw_token_idx // vocab_size)).cpu().numpy()
+    best_ids = (raw_token_idx // vocab_size).cpu().numpy()
     best_word_ids = (raw_token_idx % vocab_size).cpu().numpy()
     seq_scores = seq_scores.cpu().numpy()
 
@@ -105,9 +107,9 @@ def topk_huggingface(timestep: int,
     select_hypotheses = [[None] * num_fill for _ in range(batch_size)]
     select_num_mets = [[-1] * num_fill for _ in range(batch_size)]
 
-    func = partial(perturb, timestep, beam_size, batch_size, prune_factor, sat_tolerance, inactive, scores, hypotheses,
-                   best_ids, best_word_ids, seq_scores, num_fill, init_length, select_best_ids, select_best_word_ids,
-                   select_seq_scores, select_hypotheses, select_num_mets, pad_token_id)
+    func = partial(perturb, timestep, beam_size, batch_size, prune_factor, sat_tolerance, beta, inactive, scores,
+                   hypotheses, best_ids, best_word_ids, seq_scores, num_fill, init_length, select_best_ids,
+                   select_best_word_ids, select_seq_scores, select_hypotheses, select_num_mets, pad_token_id)
     pool = mp.Pool(mp.cpu_count())
     values = pool.map(func, [sentno for sentno in range(batch_size)])
     pool.close()
@@ -129,6 +131,7 @@ def _sequential_topk(sentno: int,
                      batch_size: int,
                      prune_factor: int,
                      sat_tolerance: float,
+                     beta: float,
                      inactive: np.array,
                      scores: np.array,
                      hypotheses: List[ConstrainedHypothesis],
@@ -167,6 +170,8 @@ def _sequential_topk(sentno: int,
         seq_score = float(seq_score)
         new_item = hypotheses[row].advance(col)
         cand = ConstrainedCandidate(row, col, seq_score, new_item)
+        if not cand.hypothesis.is_ordered():
+            continue
         if hypotheses[row].finished():
             finished_candidates.add(cand)
         elif hypotheses[row].is_valid(col) or int(best_next[row]) == col:
@@ -197,13 +202,15 @@ def _sequential_topk(sentno: int,
                 new_item = hyp.advance(col)
                 score = scores[row, col]
                 cand = ConstrainedCandidate(row, col, score, new_item)
+                if not cand.hypothesis.is_ordered():
+                    continue
                 if hyp.finished() and col in hyp.eos():
                     finished_candidates.add(cand)
                 else:
                     candidates.add(cand)
 
         # Add finished candidates in finished set:
-        if hyp.finished():
+        if hyp.finished() and hyp.is_ordered():
             best_k = np.argsort(scores[row])[::-1][:int(beam_size * 10)]
             for col in best_k:
                 if col in hyp.eos():
@@ -229,6 +236,8 @@ def _sequential_topk(sentno: int,
 
         for i, cand in enumerate(all_sorted_candidates):
             cand.rank = cand.score / (timestep - init_length + 1)
+            if cand.hypothesis.max_process():
+                cand.rank -= beta * math.log(cand.hypothesis.max_process())
         all_sorted_candidates = sorted(all_sorted_candidates, key=attrgetter('rank'), reverse=True)
 
         # Bucket candidates in each group by met order
