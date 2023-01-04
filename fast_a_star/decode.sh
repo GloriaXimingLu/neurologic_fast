@@ -17,4 +17,5 @@ CUDA_VISIBLE_DEVICES=${DEVICES} python decode_gpt2.py --model_name 'gpt2-large' 
   --batch_size 1 --beam_size 20 --max_tgt_length 32 --min_tgt_length 5 \
   --ngram_size 3 --length_penalty 0.2 \
   --prune_factor 500000 --sat_tolerance 2 \
-  --look_ahead_step 5  --alpha 0.175 --look_ahead_width 1
+  --look_ahead_step 5  --alpha 0.175 --look_ahead_width 1 \
+  --ordered
